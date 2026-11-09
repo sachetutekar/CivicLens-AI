@@ -1,151 +1,15 @@
-#Import necessary libraries
+    """Check references to passage IDs actually returned by retrieval.
 
-import os, re, time, json, hashlib, tempfile, math
-from pathlib import Path
-from collections import Counter, defaultdict
-import numpy as np
-import pandas as pd
-import fitz
-import gradio as gr
-from scipy.sparse import hstack
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.decomposition import TruncatedSVD
-from sklearn.preprocessing import normalize
-from google import genai
-from google.genai import types
+    This is citation integrity, not proof that each factual statement is true.
+    """
+    cited = {int(n) for n in re.findall(r"\[(\d+)\]", answer)}
+    invalid = sorted(n for n in cited if n < 1 or n > len(evidence))
+    if invalid:
+        return f"⚠️ The answer contains invalid evidence IDs: {invalid}. Please verify before sharing."
+    if not cited:
+        return "⚠️ No source-passage citations were detected. Treat this answer as unverified."
+    return "✅ All cited passage IDs exist in the retrieved evidence. Claim-level review is still needed."
 
-MODEL_NAME = "gemini-2.5-flash"
-MAX_FILE_MB = 20
-MAX_PAGES_PER_PDF = 600
-MAX_CHUNKS = 3000
-CHUNK_CHARS = 1050
-CHUNK_OVERLAP = 180
-TOP_K = 6
-
-GEMINI_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-if not GEMINI_KEY:
-    raise RuntimeError("Set GEMINI_API_KEY in your hosting service environment variables.")
-client = genai.Client(api_key=GEMINI_KEY)
-print("Gemini client initialized. API key not displayed.")
-
-# Document extraction and fast, reproducible local indexing
-
-def new_db():
-    return {"hash": None, "chunks": [], "vectorizers": [], "matrices": [], "svd": None, "latent": None, "files": []}
-
-def clean_text(s):
-    s = re.sub(r"[\t\r]+", " ", s)
-    s = re.sub(r"[ ]{2,}", " ", s)
-    return re.sub(r"\n{3,}", "\n\n", s).strip()
-
-def split_text(text, limit=CHUNK_CHARS, overlap=CHUNK_OVERLAP):
-    text = clean_text(text)
-    if not text: return []
-    out, pos = [], 0
-    while pos < len(text):
-        end = min(pos + limit, len(text))
-        if end < len(text):
-            cut = max(text.rfind(". ", pos + limit//2, end), text.rfind("\n", pos + limit//2, end))
-            if cut > pos: end = cut + 1
-        piece = text[pos:end].strip()
-        if len(piece) >= 60: out.append(piece)
-        if end >= len(text): break
-        pos = max(pos + 1, end - overlap)
-    return out
-
-def load_file(path):
-    p = Path(path)
-    if p.stat().st_size > MAX_FILE_MB * 1024 * 1024:
-        raise ValueError(f"{p.name} exceeds {MAX_FILE_MB} MB")
-    if p.suffix.lower() == '.pdf':
-        doc = fitz.open(str(p))
-        if doc.page_count > MAX_PAGES_PER_PDF:
-            raise ValueError(f"{p.name} exceeds {MAX_PAGES_PER_PDF} pages")
-        result = [(i+1, doc.load_page(i).get_text("text")) for i in range(doc.page_count)]
-        doc.close()
-        return result
-    if p.suffix.lower() in ('.txt', '.md'):
-        return [(1, p.read_text(encoding='utf-8', errors='replace'))]
-    raise ValueError("Only PDF, TXT and MD files are supported")
-
-def index_documents(files, db):
-    print("INDEX BUTTON CLICKED!", flush=True)
-    print(f"Received files: {files}", flush=True)
-    db = db or new_db()
-    if not files: return "Upload at least one public PDF, TXT or MD file.", "", db
-    started = time.time()
-    paths = [Path(f) for f in files]
-    digest = hashlib.sha256()
-    for p in paths:
-        digest.update(p.name.encode()); digest.update(p.read_bytes())
-    sig = digest.hexdigest()
-    if sig == db['hash']:
-        return f"Already indexed · {len(db['files'])} files · {len(db['chunks']):,} passages", "No rebuild needed.", db
-    chunks = []
-    try:
-        for p in paths:
-            for page, text in load_file(p):
-                for section in split_text(text):
-                    chunks.append({'source': p.name, 'page': page, 'text': section})
-                    if len(chunks) > MAX_CHUNKS: raise ValueError(f"Too many passages (limit {MAX_CHUNKS}). Use shorter documents.")
-        if not chunks: return "⚠️ No readable text found. Try text-based PDFs (not scans).", "", db
-        corpus = [c['text'] for c in chunks]
-        word = TfidfVectorizer(ngram_range=(1,2), min_df=1, max_features=45000, sublinear_tf=True, stop_words='english')
-        char = TfidfVectorizer(analyzer='char_wb', ngram_range=(3,5), max_features=35000, sublinear_tf=True)
-        w = word.fit_transform(corpus); c = char.fit_transform(corpus)
-        dim = min(96, w.shape[0]-1, w.shape[1]-1)
-        svd = TruncatedSVD(n_components=dim, random_state=42) if dim >= 2 else None
-        latent = normalize(svd.fit_transform(w)) if svd is not None else None
-    except Exception as e:
-        return f"Index failed: {type(e).__name__}: {str(e)}", "", db
-    db.update({'hash':sig,'chunks':chunks,'vectorizers':[word,char], 'matrices':[w,c], 'svd':svd, 'latent':latent, 'files':[p.name for p in paths]})
-    counts = Counter(x['source'] for x in chunks)
-    detail = "\n".join(f"• **{name}** — {count} searchable passages" for name,count in counts.items())
-    return f"✅ Ready · {len(paths)} documents · {len(chunks):,} passages · indexed in {time.time()-started:.1f}s", detail, db
-
-def retrieve(query, db, n=TOP_K):
-    if not db['chunks']: return []
-    word, char = db['vectorizers']; w,c = db['matrices']
-    sims = [(w @ word.transform([query]).T).toarray().ravel(), (c @ char.transform([query]).T).toarray().ravel()]
-    if db['svd'] is not None:
-        q = normalize(db['svd'].transform(word.transform([query])))
-        sims.append((db['latent'] @ q.T).ravel())
-    scores = np.zeros(len(db['chunks']), dtype=float)
-    for sim in sims:
-        ranked = np.argsort(-sim)[:min(80,len(sim))]
-        for rank, ix in enumerate(ranked):
-            if sim[ix] > 0: scores[ix] += 1.0/(60+rank+1)
-    ranked = list(np.argsort(-scores))
-
-    picked=[]; per_source=Counter()
-    distinct=len(db['files']); cap=max(2, math.ceil(n/max(1,distinct))) if distinct>1 else n
-    for ix in ranked:
-        if scores[ix] <= 0: break
-        source=db['chunks'][ix]['source']
-        if per_source[source] >= cap: continue
-        picked.append((ix,scores[ix]));per_source[source]+=1
-        if len(picked)>=n: break
-    if len(picked)<n:
-        seen={ix for ix,_ in picked}
-        for ix in ranked:
-            if scores[ix]<=0: break
-            if ix not in seen: picked.append((ix,scores[ix]));seen.add(ix)
-            if len(picked)>=n:break
-    return [dict(db['chunks'][ix], score=float(score), chunk_id=ix) for ix,score in picked]
-
-
-# Gemini generation: constrained, grounded responses +  claim audit
-
-def ask_gemini(prompt, max_tokens=1300, temperature=0.2):
-    resp = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=prompt,
-        config=types.GenerateContentConfig(temperature=temperature, max_output_tokens=max_tokens)
-    )
-    return (resp.text or '').strip()
-
-def build_evidence(items):
-    return "\n\n".join(f"[{i}] FILE: {x['source']} | PAGE: {x['page']}\n{x['text']}" for i,x in enumerate(items,1))
 
 def process_question(question, mode, db):
     db = db or new_db()
@@ -181,6 +45,7 @@ ANSWER:"""
         if not answer: raise ValueError('Gemini returned an empty answer')
     except Exception as e:
         answer=f"Gemini request failed ({type(e).__name__}). Check model access, API quota, and server connectivity. Details: {str(e)[:220]}"
+    citation_check = validate_citations(answer, evidence) if not answer.startswith("Gemini request failed") else "No citation verification: generation failed."
     evidence_md='\n\n'.join(f"**[{i}] {x['source']} · page {x['page']}**\n\n> {x['text'][:950].replace(chr(10),' ')}" for i,x in enumerate(evidence,1))
 
     try:
@@ -190,6 +55,7 @@ SOURCES:
 {context}""", max_tokens=450, temperature=0)
     except Exception as e:
         audit=f"Automatic claim audit unavailable ({type(e).__name__}); manually verify the excerpts."
+    audit = citation_check + "\n\n" + audit
     report=f"# CivicLens Research Output\n\n**Question:** {question}\n\n## Answer\n{answer}\n\n## Evidence\n{evidence_md}\n\n## Claim audit\n{audit}\n\nGenerated {time.strftime('%Y-%m-%d %H:%M:%S')} UTC. Human verification required."
     out=Path(tempfile.gettempdir())/f"civiclens_brief_{int(time.time()*1000)}.md"
     out.write_text(report, encoding='utf-8')
@@ -212,7 +78,7 @@ body {background:#0b1120 !important;}
 #tips {font-size:13px;color:#a8bbd8;}
 footer {display:none !important;}
 """
-with gr.Blocks(title='CivicLens AI | Research Intelligence Studio', css=CSS, theme=gr.themes.Soft(primary_hue='indigo', neutral_hue='slate')) as demo:
+with gr.Blocks(title='CivicLens AI | Research Intelligence Studio') as demo:
     session_db = gr.State(new_db)
     gr.HTML("""<div id="hero"><h1>✦ CivicLens AI</h1><p>Research intelligence you can trace back to the source.</p></div>""")
     gr.Markdown('**How it works:** Upload public reports → Index once → Ask, compare, or create a research brief. **Only public documents.**', elem_id='stats')
@@ -249,6 +115,8 @@ if __name__ == "__main__":
         server_port=int(os.environ.get("PORT", 7860)),
         share=False,
         show_error=True,
+        css=CSS,
+        theme=gr.themes.Soft(primary_hue='indigo', neutral_hue='slate'),
         max_file_size="20mb",
     )
 
