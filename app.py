@@ -1,3 +1,199 @@
+#Import necessary libraries
+
+import os, re, time, hashlib, tempfile, math, logging, uuid
+from pathlib import Path
+from collections import Counter, defaultdict
+import numpy as np
+import pymupdf as fitz
+import gradio as gr
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import TruncatedSVD
+from sklearn.preprocessing import normalize
+from google import genai
+from google.genai import types
+
+MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+# Default OFF for quick first indexing on small/free servers.
+# Set ENABLE_SVD=1 to recover the notebook's third (LSA) retrieval signal.
+ENABLE_SVD = os.environ.get("ENABLE_SVD", "0") == "1"
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("civiclens")
+MAX_FILE_MB = 20
+MAX_PAGES_PER_PDF = 600
+MAX_CHUNKS = 3000
+MAX_FILES = 8
+CHUNK_CHARS = 1050
+CHUNK_OVERLAP = 180
+TOP_K = 6
+
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+if not GEMINI_KEY:
+    raise RuntimeError("Set GEMINI_API_KEY in your hosting service environment variables.")
+client = genai.Client(api_key=GEMINI_KEY)
+print("Gemini client initialized. API key not displayed.")
+
+# Document extraction and fast, reproducible local indexing
+
+def new_db():
+    return {"hash": None, "chunks": [], "vectorizers": [], "matrices": [], "svd": None, "latent": None, "files": [], "stats": {}}
+
+def clean_text(s):
+    s = re.sub(r"[\t\r]+", " ", s)
+    s = re.sub(r"[ ]{2,}", " ", s)
+    return re.sub(r"\n{3,}", "\n\n", s).strip()
+
+def split_text(text, limit=CHUNK_CHARS, overlap=CHUNK_OVERLAP):
+    text = clean_text(text)
+    if not text: return []
+    out, pos = [], 0
+    while pos < len(text):
+        end = min(pos + limit, len(text))
+        if end < len(text):
+            cut = max(text.rfind(". ", pos + limit//2, end), text.rfind("\n", pos + limit//2, end))
+            if cut > pos: end = cut + 1
+        piece = text[pos:end].strip()
+        if len(piece) >= 60: out.append(piece)
+        if end >= len(text): break
+        pos = max(pos + 1, end - overlap)
+    return out
+
+def load_file(path):
+    """Yield text one PDF page at a time, preserving the original source-page citation."""
+    p = Path(path)
+    if p.stat().st_size > MAX_FILE_MB * 1024 * 1024:
+        raise ValueError(f"{p.name} exceeds {MAX_FILE_MB} MB")
+    if p.suffix.lower() == '.pdf':
+        with fitz.open(str(p)) as doc:
+            if doc.page_count > MAX_PAGES_PER_PDF:
+                raise ValueError(f"{p.name} exceeds {MAX_PAGES_PER_PDF} pages")
+            for i in range(doc.page_count):
+                yield i + 1, doc.load_page(i).get_text("text")
+    elif p.suffix.lower() in ('.txt', '.md'):
+        yield 1, p.read_text(encoding='utf-8', errors='replace')
+    else:
+        raise ValueError("Only PDF, TXT and MD files are supported")
+
+
+def signature_for_files(paths):
+    """Stream file hashes without duplicating entire PDFs in memory."""
+    digest = hashlib.sha256()
+    for p in paths:
+        digest.update(p.name.encode('utf-8'))
+        with p.open('rb') as fh:
+            for block in iter(lambda: fh.read(1024 * 1024), b''):
+                digest.update(block)
+    return digest.hexdigest()
+
+
+def index_documents(files, db):
+    db = db or new_db()
+    if not files:
+        return "Upload at least one public PDF, TXT or MD file.", "", db
+    started = time.perf_counter()
+    paths = [Path(getattr(f, 'name', f)) for f in files]
+    if len(paths) > MAX_FILES:
+        return f"Upload at most {MAX_FILES} documents.", "", db
+    try:
+        signature = signature_for_files(paths)
+        if signature == db.get('hash'):
+            return f"✅ Already indexed · {len(db['files'])} documents · {len(db['chunks']):,} passages", "No rebuild needed.", db
+
+        chunks = []
+        for path in paths:
+            for page, page_text in load_file(path):
+                for section in split_text(page_text):
+                    chunks.append({'source': path.name, 'page': page, 'text': section})
+                    if len(chunks) > MAX_CHUNKS:
+                        raise ValueError(f"Too many passages (limit {MAX_CHUNKS}). Use fewer documents.")
+        extraction_secs = time.perf_counter() - started
+        if not chunks:
+            return "⚠️ No readable text found. Scanned PDFs need OCR, which this demo does not perform.", "", db
+        corpus = [item['text'] for item in chunks]
+
+        # Original Colab retrieval signals: word and character n-gram TF-IDF.
+        # Smaller vocabulary and shorter char n-grams make indexing fast on free CPUs.
+        word = TfidfVectorizer(ngram_range=(1, 2), min_df=1, max_features=18000,
+                               sublinear_tf=True, stop_words='english', dtype=np.float32)
+        char = TfidfVectorizer(analyzer='char_wb', ngram_range=(3, 4),
+                               max_features=12000, sublinear_tf=True, dtype=np.float32)
+        w = word.fit_transform(corpus)
+        c = char.fit_transform(corpus)
+        tfidf_secs = time.perf_counter() - started - extraction_secs
+
+        # Optional third retrieval view from the notebook, OFF by default.
+        # Avoid high-dimensional randomized SVD for a tiny free Render instance.
+        svd, latent = None, None
+        if ENABLE_SVD:
+            dim = min(16, w.shape[0] - 1, w.shape[1] - 1)
+            if dim >= 2:
+                svd = TruncatedSVD(n_components=dim, n_iter=3, random_state=42)
+                latent = normalize(svd.fit_transform(w))
+
+        db = {'hash': signature, 'chunks': chunks, 'vectorizers': [word, char],
+              'matrices': [w, c], 'svd': svd, 'latent': latent,
+              'files': [p.name for p in paths],
+              'stats': {'extract_sec': extraction_secs, 'tfidf_sec': tfidf_secs}}
+        elapsed = time.perf_counter() - started
+        logger.info("INDEXED files=%d passages=%d extract=%.2fs tfidf=%.2fs total=%.2fs svd=%s",
+                    len(paths), len(chunks), extraction_secs, tfidf_secs, elapsed, ENABLE_SVD)
+        counts = Counter(item['source'] for item in chunks)
+        detail = "\n".join(f"• **{name}** — {count} searchable passages" for name, count in counts.items())
+        return (f"✅ Ready · {len(paths)} documents · {len(chunks):,} passages · "
+                f"indexed in {elapsed:.1f}s", detail, db)
+    except Exception as exc:
+        logger.exception("Indexing failed")
+        return f"Index failed: {type(exc).__name__}: {str(exc)}", "", db
+
+
+def retrieve(query, db, n=TOP_K):
+    if not db['chunks']: return []
+    word, char = db['vectorizers']; w,c = db['matrices']
+    sims = [(w @ word.transform([query]).T).toarray().ravel(), (c @ char.transform([query]).T).toarray().ravel()]
+    if db['svd'] is not None:
+        q = normalize(db['svd'].transform(word.transform([query])))
+        sims.append((db['latent'] @ q.T).ravel())
+    scores = np.zeros(len(db['chunks']), dtype=float)
+    for sim in sims:
+        ranked = np.argsort(-sim)[:min(80,len(sim))]
+        for rank, ix in enumerate(ranked):
+            if sim[ix] > 0: scores[ix] += 1.0/(60+rank+1)
+    ranked = list(np.argsort(-scores))
+
+    picked=[]; per_source=Counter()
+    distinct=len(db['files']); cap=max(2, math.ceil(n/max(1,distinct))) if distinct>1 else n
+    for ix in ranked:
+        if scores[ix] <= 0: break
+        source=db['chunks'][ix]['source']
+        if per_source[source] >= cap: continue
+        picked.append((ix,scores[ix]));per_source[source]+=1
+        if len(picked)>=n: break
+    if len(picked)<n:
+        seen={ix for ix,_ in picked}
+        for ix in ranked:
+            if scores[ix]<=0: break
+            if ix not in seen: picked.append((ix,scores[ix]));seen.add(ix)
+            if len(picked)>=n:break
+    return [dict(db['chunks'][ix], score=float(score), chunk_id=ix) for ix,score in picked]
+
+
+# Gemini generation: constrained, grounded responses +  claim audit
+
+def ask_gemini(prompt, max_tokens=1300, temperature=0.2):
+    resp = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=prompt,
+        config=types.GenerateContentConfig(temperature=temperature, max_output_tokens=max_tokens)
+    )
+    return (resp.text or '').strip()
+
+def build_evidence(items):
+    return "\n\n".join(f"[{i}] FILE: {x['source']} | PAGE: {x['page']}\n{x['text']}" for i,x in enumerate(items,1))
+
+def validate_citations(answer, evidence):
+    """Check references to passage IDs actually returned by retrieval.
+
+    This is citation integrity, not proof that each factual statement is true.
+    """
     cited = {int(n) for n in re.findall(r"\[(\d+)\]", answer)}
     invalid = sorted(n for n in cited if n < 1 or n > len(evidence))
     if invalid:
@@ -115,4 +311,3 @@ if __name__ == "__main__":
         theme=gr.themes.Soft(primary_hue='indigo', neutral_hue='slate'),
         max_file_size="20mb",
     )
-
