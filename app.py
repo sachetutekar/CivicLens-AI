@@ -69,6 +69,8 @@ def load_file(path):
     raise ValueError("Only PDF, TXT and MD files are supported")
 
 def index_documents(files, db):
+    print("INDEX BUTTON CLICKED!", flush=True)
+    print(f"Received files: {files}", flush=True)
     db = db or new_db()
     if not files: return "Upload at least one public PDF, TXT or MD file.", "", db
     started = time.time()
