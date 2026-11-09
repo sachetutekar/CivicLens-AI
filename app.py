@@ -1,7 +1,3 @@
-    """Check references to passage IDs actually returned by retrieval.
-
-    This is citation integrity, not proof that each factual statement is true.
-    """
     cited = {int(n) for n in re.findall(r"\[(\d+)\]", answer)}
     invalid = sorted(n for n in cited if n < 1 or n > len(evidence))
     if invalid:
