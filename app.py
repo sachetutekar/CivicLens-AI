@@ -246,7 +246,7 @@ if __name__ == "__main__":
         server_name="0.0.0.0",
         server_port=int(os.environ.get("PORT", 7860)),
         share=False,
-        show_error=False,
+        show_error=True,
         max_file_size="20mb",
     )
 
