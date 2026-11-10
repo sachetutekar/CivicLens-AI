@@ -25,6 +25,9 @@ MAX_FILES = 8
 CHUNK_CHARS = 1050
 CHUNK_OVERLAP = 180
 TOP_K = 6
+# Default faster character retrieval; use FAST_INDEX=0 to restore the previous
+# 3-4 character n-gram configuration for an A/B retrieval-quality comparison.
+FAST_INDEX = os.environ.get("FAST_INDEX", "1") != "0"
 
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
 if not GEMINI_KEY:
@@ -114,11 +117,19 @@ def index_documents(files, db):
         # Smaller vocabulary and shorter char n-grams make indexing fast on free CPUs.
         word = TfidfVectorizer(ngram_range=(1, 2), min_df=1, max_features=18000,
                                sublinear_tf=True, stop_words='english', dtype=np.float32)
-        char = TfidfVectorizer(analyzer='char_wb', ngram_range=(3, 4),
-                               max_features=12000, sublinear_tf=True, dtype=np.float32)
+        # 3-grams keep tolerance to spelling differences and minor text variants.
+        # Dropping 4-grams greatly reduces char processing on small CPUs.
+        char = TfidfVectorizer(analyzer='char_wb',
+                               ngram_range=(3, 3) if FAST_INDEX else (3, 4),
+                               max_features=6000 if FAST_INDEX else 12000,
+                               sublinear_tf=True, dtype=np.float32)
+        word_started = time.perf_counter()
         w = word.fit_transform(corpus)
+        word_secs = time.perf_counter() - word_started
+        char_started = time.perf_counter()
         c = char.fit_transform(corpus)
-        tfidf_secs = time.perf_counter() - started - extraction_secs
+        char_secs = time.perf_counter() - char_started
+        tfidf_secs = word_secs + char_secs
 
         # Optional third retrieval view from the notebook, OFF by default.
         # Avoid high-dimensional randomized SVD for a tiny free Render instance.
@@ -132,14 +143,14 @@ def index_documents(files, db):
         db = {'hash': signature, 'chunks': chunks, 'vectorizers': [word, char],
               'matrices': [w, c], 'svd': svd, 'latent': latent,
               'files': [p.name for p in paths],
-              'stats': {'extract_sec': extraction_secs, 'tfidf_sec': tfidf_secs}}
+              'stats': {'extract_sec': extraction_secs, 'word_sec': word_secs, 'char_sec': char_secs, 'tfidf_sec': tfidf_secs}}
         elapsed = time.perf_counter() - started
-        logger.info("INDEXED files=%d passages=%d extract=%.2fs tfidf=%.2fs total=%.2fs svd=%s",
-                    len(paths), len(chunks), extraction_secs, tfidf_secs, elapsed, ENABLE_SVD)
+        logger.info("INDEXED files=%d passages=%d pdf_extract=%.2fs word=%.2fs char=%.2fs total=%.2fs fast=%s svd=%s",
+                    len(paths), len(chunks), extraction_secs, word_secs, char_secs, elapsed, FAST_INDEX, ENABLE_SVD)
         counts = Counter(item['source'] for item in chunks)
         detail = "\n".join(f"• **{name}** — {count} searchable passages" for name, count in counts.items())
         return (f"✅ Ready · {len(paths)} documents · {len(chunks):,} passages · "
-                f"indexed in {elapsed:.1f}s", detail, db)
+                f"indexed in {elapsed:.1f}s (PDF {extraction_secs:.1f}s · word {word_secs:.1f}s · char {char_secs:.1f}s)", detail, db)
     except Exception as exc:
         logger.exception("Indexing failed")
         return f"Index failed: {type(exc).__name__}: {str(exc)}", "", db
@@ -311,3 +322,4 @@ if __name__ == "__main__":
         theme=gr.themes.Soft(primary_hue='indigo', neutral_hue='slate'),
         max_file_size="20mb",
     )
+
